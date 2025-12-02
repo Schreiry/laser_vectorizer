@@ -1,6 +1,6 @@
 """
 main.py
-Запуск приложения.
+Точка входа в Enterprise Vectorizer.
 """
 from cli import ConsoleApp
 

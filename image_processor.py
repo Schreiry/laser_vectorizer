@@ -1,7 +1,7 @@
 """
 image_processor.py
-Модуль компьютерного зрения High-End класса.
-Логика: CLAHE Contrast -> Adaptive Threshold -> Morphological Cleaning -> Skeleton.
+Модуль обработки изображений промышленного уровня.
+Pipeline: Upscale -> Gamma -> DoG -> Threshold -> Despeckle -> Skeleton.
 """
 import cv2
 import numpy as np
@@ -19,70 +19,67 @@ class ImageProcessor:
 
     def preprocess(self, img: np.ndarray) -> np.ndarray:
         """
-        Превращает цветную картинку в идеальную бинарную маску для скелетизации.
+        Превращает "грязный" скан/фото в идеальную топологическую карту линий.
         """
-        # 1. Ч/Б + Умное размытие (убирает шум бумаги/текстуры)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Bilateral Filter очень важен: он замыливает "шерсть", но оставляет контур
-        blurred = cv2.bilateralFilter(gray, 9, self.cfg.BILATERAL_SIGMA, self.cfg.BILATERAL_SIGMA)
+        # 1. UPSCALING (Суперсэмплинг)
+        if self.cfg.SCALE_FACTOR > 1:
+            h, w = img.shape[:2]
+            img = cv2.resize(img, (w * self.cfg.SCALE_FACTOR, h * self.cfg.SCALE_FACTOR), 
+                             interpolation=cv2.INTER_CUBIC)
 
-        # 2. Усиление локального контраста (CLAHE)
-        # Это делает слабые линии карандаша четкими и черными.
-        clahe = cv2.createCLAHE(clipLimit=self.cfg.CLAHE_CLIP, tileGridSize=(8, 8))
-        contrast = clahe.apply(blurred)
-
-        # 3. Адаптивная бинаризация (Gaussian)
-        # Лучший метод для рисунков. Ищет линии относительно фона, а не абсолютного цвета.
-        binary = cv2.adaptiveThreshold(
-            contrast, 
-            255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 
-            self.cfg.ADAPTIVE_BLOCK_SIZE, 
-            self.cfg.ADAPTIVE_C
-        )
-
-        # 4. Инверсия (если нужно получить белые линии на черном)
-        # Если INVERT_INPUT=True (черный рисунок на белом), то мы инвертируем,
-        # чтобы линии стали белыми (255) для алгоритма скелетизации.
-        if self.cfg.INVERT_INPUT:
-            binary = cv2.bitwise_not(binary)
+        # 2. GRAYSCALE
+        if len(img.shape) == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         else:
-            # Если фон уже черный, а линии белые - инвертировать обратно
-            binary = cv2.bitwise_not(binary)
-            binary = cv2.bitwise_not(binary) # костыль для логики, оставляем как есть
+            gray = img
 
-        # 5. Чистка "соли и перца" (мелких точек)
+        # 3. GAMMA CORRECTION (Нормализация света)
+        # Позволяет вытянуть детали из теней
+        invGamma = 1.0 / self.cfg.GAMMA
+        table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+        gray = cv2.LUT(gray, table)
+
+        # 4. DIFFERENCE OF GAUSSIANS (DoG)
+        # Магический метод для extract line drawings.
+        # Вычитаем сильно размытое из слабо размытого -> остаются только края нужной частоты.
+        g1 = cv2.GaussianBlur(gray, (0, 0), sigmaX=self.cfg.DOG_K1)
+        g2 = cv2.GaussianBlur(gray, (0, 0), sigmaX=self.cfg.DOG_K2)
+        dog = cv2.subtract(g1, g2)
+
+        # 5. BINARIZATION
+        # DoG возвращает темные линии на сером фоне. Инвертируем.
+        dog = cv2.bitwise_not(dog)
+        # Применяем жесткий порог для выделения линий
+        _, binary = cv2.threshold(dog, self.cfg.BINARY_THRESHOLD, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        
+        # Инвертируем обратно: нам нужны БЕЛЫЕ линии на ЧЕРНОМ фоне для скелетизации
+        binary = cv2.bitwise_not(binary)
+
+        # 6. MORPHOLOGICAL CLEANING (Despeckle)
+        # Удаляем шум
+        nb_components, output, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        sizes = stats[1:, -1]
+        nb_components = nb_components - 1
+        
+        clean_img = np.zeros((output.shape), dtype=np.uint8)
+        min_size = self.cfg.MIN_SPECKLE_AREA * (self.cfg.SCALE_FACTOR ** 2) / 2 # Корректируем под масштаб
+        
+        for i in range(0, nb_components):
+            if sizes[i] >= min_size:
+                clean_img[output == i + 1] = 255
+
+        # 7. CLOSING (Залечивание разрывов)
+        # Небольшое закрытие дыр внутри линий
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        closed = cv2.morphologyEx(clean_img, cv2.MORPH_CLOSE, kernel, iterations=2)
         
-        # Morph Open: убирает белый шум (точки)
-        opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-        # Morph Close: закрывает дырки внутри линий
-        closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        # 6. Удаление мусора по площади (очень важно для чистоты вектора)
-        cleaned = self._remove_small_components(closed, self.cfg.MIN_COMPONENT_AREA)
-        
-        # 7. Финальное утолщение (Dilation)
-        # Чуть утолщаем линии перед скелетизацией, чтобы они гарантированно сцепились
-        dilated = cv2.dilate(cleaned, kernel, iterations=1)
-
-        return dilated
-
-    def _remove_small_components(self, binary_img: np.ndarray, min_area: int) -> np.ndarray:
-        """Удаляет все изолированные объекты меньше min_area."""
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_img, connectivity=8)
-        output = np.zeros_like(binary_img)
-        
-        for i in range(1, num_labels): # 0 - это фон
-            if stats[i, cv2.CC_STAT_AREA] >= min_area:
-                output[labels == i] = 255
-        return output
+        return closed
 
     def skeletonize(self, binary_img: np.ndarray) -> np.ndarray:
+        """Получение однопиксельного скелета (Centerline extraction)."""
         try:
-            # Алгоритм Чжан-Суеня (Zhang-Suen) - идеален для получения центров линий
-            return cv2.ximgproc.thinning(binary_img, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+            # Zhang-Suen - золотой стандарт топологии
+            skel = cv2.ximgproc.thinning(binary_img, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+            return skel
         except AttributeError:
-            raise ImportError("Нет модуля cv2.ximgproc. Выполните: pip install opencv-contrib-python-headless")
+            raise ImportError("Critical: cv2.ximgproc not found. Install opencv-contrib-python-headless.")
